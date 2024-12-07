@@ -1,0 +1,201 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <fauxmoESP.h>
+#include <esp_wifi.h>
+
+#define SENSOR_PIN 34   // Pino analógico para o sensor de umidade
+#define RELAY_PIN 25    // Pino para o relé que controla a válvula solenóide
+
+const char* ssid = "miniclinica";
+const char* password = "naoseimano";
+
+fauxmoESP fauxmo;
+
+unsigned long sensorActivatedTime = 0;
+bool motorActive = false;
+bool sensorDisabled = false;
+unsigned long sensorDisableTime = 0;
+
+unsigned long relayActivatedTime = 0;
+bool relayActive = false;
+
+// Endereço MAC fixo para a ESP32
+uint8_t fixedMacAddress[] = {0xD4, 0x8F, 0xFF, 0x98, 0xCB, 0x9C};
+
+// Endereço MAC da ESP8266 (destinatário)
+uint8_t broadcastAddress[] = {0x5F, 0xCF, 0x7F, 0x13, 0xE2, 0x46}; // Substitua pelo endereço MAC da sua ESP8266
+
+// Estrutura para enviar mensagens
+typedef struct struct_message {
+  char message[32];
+} struct_message;
+
+// Flags para indicar que comandos devem ser executados
+volatile bool enviarPetisco = false;
+volatile bool ativarDescarga = false;
+
+// Função para enviar comandos via ESP-NOW
+void enviarComando(const char *comando) {
+  Serial.printf("Enviando comando: %s\n", comando);
+  struct_message dataToSend;
+  strncpy(dataToSend.message, comando, sizeof(dataToSend.message));
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &dataToSend, sizeof(dataToSend));
+
+  if (result == ESP_OK) {
+    Serial.println("Comando enviado com sucesso");
+  } else {
+    Serial.println("Erro ao enviar comando");
+  }
+}
+
+// Função de callback para envio de dados via ESP-NOW
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Status do envio para ");
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac_addr[0], mac_addr[1], mac_addr[2],
+           mac_addr[3], mac_addr[4], mac_addr[5]);
+  Serial.print(macStr);
+  Serial.print(" é: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Sucesso" : "Falha");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Relé desligado inicialmente (ativo em LOW)
+  Serial.println("Iniciando ESP32");
+
+  // Conecta-se ao Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.setHostname("ESP32_Fixed_MAC");
+  esp_wifi_set_mac(WIFI_IF_STA, fixedMacAddress);
+  WiFi.begin(ssid, password);
+  Serial.println("Conectando ao Wi-Fi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConectado ao Wi-Fi");
+
+  // Inicializa o ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Erro ao inicializar ESP-NOW");
+    return;
+  }
+  Serial.println("ESP-NOW inicializado");
+
+  // Registra a função de callback para envio de dados
+  esp_now_register_send_cb(OnDataSent);
+
+  // Remove o peer existente, se houver
+  esp_now_del_peer(broadcastAddress);
+
+  // Adiciona o peer (ESP8266)
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Falha ao adicionar peer");
+    return;
+  }
+  Serial.println("Peer adicionado com sucesso");
+
+  // Configura o FauxmoESP para simular dispositivos Alexa
+  fauxmo.createServer(true);
+  fauxmo.setPort(80);
+
+  fauxmo.enable(true);
+  fauxmo.addDevice("Descarga");
+  fauxmo.addDevice("Racao"); // "Ração" sem acento
+  Serial.println("FauxmoESP configurado");
+
+  fauxmo.onSetState([](unsigned char device_id, const char * device_name, bool state, unsigned char value) {
+    Serial.printf("Dispositivo '%s' mudou para %s\n", device_name, state ? "ON" : "OFF");
+    if (strcmp(device_name, "Racao") == 0) {
+      if (state) {
+        enviarPetisco = true; // Define a flag para enviar o comando no loop principal
+      }
+    } else if (strcmp(device_name, "Descarga") == 0) {
+      if (state) {
+        ativarDescarga = true; // Define a flag para ativar a descarga no loop principal
+      }
+    }
+  });
+}
+
+void loop() {
+  fauxmo.handle();
+
+  // Verifica se precisamos enviar o comando para liberar petisco
+  if (enviarPetisco) {
+    enviarComando("Liberar Racao");
+    enviarPetisco = false;
+  }
+
+  // Verifica se precisamos ativar a descarga
+  if (ativarDescarga) {
+    iniciarDescarga();
+    ativarDescarga = false;
+  }
+
+  // Código relacionado ao sensor de umidade e controle do relé (descarga)
+  static unsigned long lastSerialPrint = 0;
+  if (millis() - lastSerialPrint >= 1000) {
+    int sensorValue = analogRead(SENSOR_PIN);
+    Serial.printf("Valor do sensor de umidade: %d\n", sensorValue);
+    lastSerialPrint = millis();
+  }
+
+  if (sensorDisabled) {
+    unsigned long elapsed = millis() - sensorDisableTime;
+    if (elapsed >= 180000) {
+      sensorDisabled = false;
+      Serial.println("Sensor reativado");
+    }
+  } else {
+    int sensorValue = analogRead(SENSOR_PIN);
+
+    if (motorActive) {
+      unsigned long elapsed = millis() - sensorActivatedTime;
+      if (elapsed >= 10000) {
+        iniciarDescarga();
+        enviarComando("Liberar Racao");
+        motorActive = false;
+
+        sensorDisabled = true;
+        sensorDisableTime = millis();
+        Serial.println("Sensor desabilitado por 3 minutos");
+      }
+    } else {
+      if (sensorValue < 2800) {
+        Serial.println("Umidade detectada");
+        if (!motorActive) {
+          sensorActivatedTime = millis();
+          motorActive = true;
+          Serial.println("Iniciando temporizador de 10 segundos");
+        }
+      }
+    }
+  }
+
+  // Gerencia o tempo do relé (descarga)
+  if (relayActive) {
+    if (millis() - relayActivatedTime >= 10000) {
+      digitalWrite(RELAY_PIN, HIGH); // Desativa o relé
+      relayActive = false;
+      Serial.println("Relé desligado");
+    }
+  }
+}
+
+void iniciarDescarga() {
+  Serial.println("Ativando descarga");
+  digitalWrite(RELAY_PIN, LOW); // Ativa o relé (ativo em LOW)
+  relayActivatedTime = millis();
+  relayActive = true;
+  Serial.println("Relé ligado");
+}
